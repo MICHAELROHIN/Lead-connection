@@ -340,6 +340,14 @@ select:focus {
   color: #fff;
 }
 
+button:disabled,
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
 .badge {
   border-radius: 999px;
   font-size: 11px;
@@ -372,6 +380,45 @@ select:focus {
 .badge.no-response {
   background: #fde9e9;
   color: #ae3d3d;
+}
+
+.badge.interested {
+  background: #e4f7eb;
+  color: #0b7f54;
+}
+
+.badge.not-interested {
+  background: #fceaea;
+  color: #b33f3f;
+}
+
+.badge.unknown {
+  background: #eef1f3;
+  color: #57616b;
+}
+
+.badge.open {
+  background: #e8f3ff;
+  color: #1f5fa6;
+}
+
+.badge.closed {
+  background: #f5eaea;
+  color: #a43a3a;
+}
+
+.reply-cell {
+  display: grid;
+  gap: 6px;
+  min-width: 220px;
+}
+
+.reply-input {
+  min-width: 200px;
+}
+
+.status-note {
+  margin-top: 10px;
 }
 
 .chips {

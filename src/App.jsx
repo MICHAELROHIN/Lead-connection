@@ -112,6 +112,29 @@ const DEFAULT_WATI = {
   templateName: 'promo_reel_campaign',
 }
 
+const LEAD_CHAT_DEFAULTS = {
+  chatState: 'Open',
+  intent: 'Unknown',
+  lastReply: '',
+  lastReplyAt: null,
+  autoReply: '',
+  autoReplyAt: null,
+  autoReplySource: 'generic',
+}
+
+const PRODUCT_AUTO_REPLIES = {
+  Automotive:
+    'For automotive plans, we cover own damage, third-party liability, and optional add-ons like zero depreciation and roadside assistance.',
+  Health:
+    'For health plans, we offer individual and family options with cashless network hospitals, waiting period details, and claim support.',
+  Education:
+    'For education plans, we provide goal-based savings with flexible tenure and payout options aligned to college milestones.',
+  Business:
+    'For business plans, we provide risk coverage plus continuity protection with options based on company size and turnover.',
+  General:
+    'We can share product highlights, eligibility, pricing, and the best matching plan for your requirement.',
+}
+
 function loadState(key, fallback) {
   try {
     const raw = localStorage.getItem(key)
@@ -187,15 +210,93 @@ function parseCsv(text) {
   })
 }
 
+function withLeadDefaults(lead) {
+  return { ...LEAD_CHAT_DEFAULTS, ...lead }
+}
+
+function detectIntent(replyText) {
+  const text = String(replyText || '').toLowerCase()
+  if (!text.trim()) return 'Unknown'
+
+  const interestedSignals = ['interested', 'yes', 'tell me', 'details', 'call me', 'quote', 'price', 'plan']
+  const notInterestedSignals = ['not interested', 'no', 'stop', 'do not contact', "don't contact", 'unsubscribe']
+
+  if (notInterestedSignals.some((signal) => text.includes(signal))) return 'Not Interested'
+  if (interestedSignals.some((signal) => text.includes(signal))) return 'Interested'
+  return 'Unknown'
+}
+
+function buildAutoReply(intent, leadName) {
+  if (intent === 'Not Interested') {
+    return `Thanks ${leadName}. We have closed this chat. If you need help later, just message us anytime.`
+  }
+  if (intent === 'Interested') {
+    return `Thanks ${leadName}. Great to hear you are interested. Our advisor will contact you shortly with the best plan options.`
+  }
+  return `Thanks ${leadName}. We received your reply and our team will get back to you shortly.`
+}
+
+function looksLikeQuestion(text) {
+  const value = String(text || '').toLowerCase()
+  if (!value.trim()) return false
+  return (
+    value.includes('?') ||
+    /\b(what|how|can|which|when|why|price|premium|plan|details|coverage|waiting period)\b/i.test(value)
+  )
+}
+
+function extractPremiumInputsFromText(text) {
+  const value = String(text || '')
+  const ageMatch = value.match(/age\s*(\d+)/i)
+  const coverageLakhMatch = value.match(/(\d+)\s*lakh/i)
+  const coverageRsMatch = value.match(/(?:rs\.?|inr\s*)(\d+)/i)
+  const risk = /high/i.test(value)
+    ? 'high'
+    : /medium/i.test(value)
+      ? 'medium'
+      : 'low'
+
+  const age = ageMatch ? Number(ageMatch[1]) : 30
+  const coverage = coverageLakhMatch
+    ? Number(coverageLakhMatch[1]) * 100000
+    : coverageRsMatch
+      ? Number(coverageRsMatch[1])
+      : 500000
+
+  return { age, coverage, risk }
+}
+
+function isPremiumQuestion(text) {
+  return /\b(premium|coverage|sum insured|risk|age|lakh|monthly)\b/i.test(String(text || ''))
+}
+
+function buildProductAutoReply(lead, replyText) {
+  if (isPremiumQuestion(replyText)) {
+    const { age, coverage, risk } = extractPremiumInputsFromText(replyText)
+    const premium = calcPremium(age, coverage, risk)
+    return {
+      message: `For ${lead.name}, estimated monthly premium is Rs.${premium} for age ${age}, coverage Rs.${coverage.toLocaleString('en-IN')}, and ${risk} risk profile.`,
+      source: 'calculator',
+    }
+  }
+
+  const productLine = PRODUCT_AUTO_REPLIES[lead.category] || PRODUCT_AUTO_REPLIES.General
+  return {
+    message: `Thanks ${lead.name}. ${productLine}`,
+    source: 'product',
+  }
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
-  const [leads, setLeads] = useState(() => loadState(DB_KEYS.leads, DEFAULT_LEADS))
+  const [leads, setLeads] = useState(() => loadState(DB_KEYS.leads, DEFAULT_LEADS).map(withLeadDefaults))
   const [rules, setRules] = useState(() => loadState(DB_KEYS.rules, DEFAULT_RULES))
   const [queries, setQueries] = useState(() => loadState(DB_KEYS.queries, DEFAULT_QUERIES))
   const [wati, setWati] = useState(() => loadState(DB_KEYS.wati, DEFAULT_WATI))
   const [selectedCategory, setSelectedCategory] = useState('All')
   const [campaignMessage, setCampaignMessage] = useState('Hi {{name}}, sharing a quick reel selected for your category. Reply YES to connect now.')
   const [log, setLog] = useState('')
+  const [replyDrafts, setReplyDrafts] = useState({})
 
   const [newLead, setNewLead] = useState({
     name: '',
@@ -222,7 +323,7 @@ function App() {
 
   const attentionItems = useMemo(() => {
     return leads
-      .filter((lead) => lead.status === 'Follow-up' || lead.status === 'No Response')
+      .filter((lead) => (lead.status === 'Follow-up' || lead.status === 'No Response') && lead.chatState !== 'Closed')
       .sort((a, b) => a.followUpAt - b.followUpAt)
   }, [leads])
 
@@ -232,21 +333,36 @@ function App() {
   }, [leads, selectedCategory])
 
   const campaignTargets = useMemo(() => {
-    return filteredLeads.filter((lead) => lead.status !== 'Converted' && lead.phone)
+    return filteredLeads.filter(
+      (lead) => lead.status !== 'Converted' && lead.chatState !== 'Closed' && lead.phone,
+    )
   }, [filteredLeads])
 
   const stats = useMemo(() => {
+    const interestedLeads = leads.filter((lead) => lead.intent === 'Interested')
     return {
       total: leads.length,
       converted: leads.filter((lead) => lead.status === 'Converted').length,
       purchased: leads.filter((lead) => lead.source === 'Purchased').length,
-      openQueries: queries.filter((query) => !query.answered).length,
+      openQueries: queries.filter((query) => {
+        const lead = leads.find((item) => item.id === query.leadId)
+        return !query.answered && lead?.chatState !== 'Closed'
+      }).length,
+      interested: interestedLeads.length,
+      closedChats: leads.filter((lead) => lead.chatState === 'Closed').length,
     }
   }, [leads, queries])
 
+  const interestedLeads = useMemo(() => {
+    return leads
+      .filter((lead) => lead.intent === 'Interested')
+      .sort((a, b) => (b.lastReplyAt || 0) - (a.lastReplyAt || 0))
+  }, [leads])
+
   function persistLeads(next) {
-    setLeads(next)
-    saveState(DB_KEYS.leads, next)
+    const normalized = next.map(withLeadDefaults)
+    setLeads(normalized)
+    saveState(DB_KEYS.leads, normalized)
   }
 
   function persistRules(next) {
@@ -342,12 +458,78 @@ function App() {
   }
 
   function moveLeadStatus(id, status) {
+    const current = leads.find((lead) => lead.id === id)
+    if (!current || current.chatState === 'Closed') {
+      setLog(`Status update blocked. Chat is closed for ${current?.name || 'this lead'}.`)
+      return
+    }
     const next = leads.map((lead) => (lead.id === id ? { ...lead, status } : lead))
     persistLeads(next)
   }
 
+  function processLeadReply(leadId) {
+    const replyText = String(replyDrafts[leadId] || '').trim()
+    if (!replyText) return
+
+    const lead = leads.find((item) => item.id === leadId)
+    if (!lead || lead.chatState === 'Closed') return
+
+    const intent = detectIntent(replyText)
+    const shouldUseProductReply = looksLikeQuestion(replyText) && intent !== 'Not Interested'
+    const productReply = shouldUseProductReply ? buildProductAutoReply(lead, replyText) : null
+    const autoReply = productReply ? productReply.message : buildAutoReply(intent, lead.name)
+    const autoReplySource = productReply ? productReply.source : 'generic'
+
+    const next = leads.map((item) => {
+      if (item.id !== leadId) return item
+
+      const isNotInterested = intent === 'Not Interested'
+      const isInterested = intent === 'Interested'
+
+      return {
+        ...item,
+        lastReply: replyText,
+        lastReplyAt: Date.now(),
+        autoReply,
+        autoReplyAt: Date.now(),
+        autoReplySource,
+        intent,
+        chatState: isNotInterested ? 'Closed' : 'Open',
+        status: isNotInterested ? 'No Response' : isInterested ? 'Qualified' : item.status,
+      }
+    })
+
+    persistLeads(next)
+    setReplyDrafts((prev) => ({ ...prev, [leadId]: '' }))
+
+    if (intent === 'Not Interested') {
+      setLog(`Auto-responded to ${lead.name}. Lead marked not interested and chat closed.`)
+      return
+    }
+    if (intent === 'Interested') {
+      setLog(`Auto-responded to ${lead.name}. Lead marked interested and shown on dashboard.`)
+      return
+    }
+    if (autoReplySource === 'calculator') {
+      setLog(`Auto-responded to ${lead.name} using calculator-based premium estimation.`)
+      return
+    }
+    if (autoReplySource === 'product') {
+      setLog(`Auto-responded to ${lead.name} with product-specific information.`)
+      return
+    }
+    setLog(`Auto-responded to ${lead.name}. Intent is unclear, keeping chat open.`)
+  }
+
   function answerQuery(id) {
-    const next = queries.map((query) => (query.id === id ? { ...query, answered: true } : query))
+    const query = queries.find((item) => item.id === id)
+    const lead = leads.find((item) => item.id === query?.leadId)
+    if (lead?.chatState === 'Closed') {
+      setLog(`Query action blocked for ${lead.name}. Chat is closed.`)
+      return
+    }
+
+    const next = queries.map((item) => (item.id === id ? { ...item, answered: true } : item))
     persistQueries(next)
   }
 
@@ -452,6 +634,8 @@ function App() {
           <span>{stats.total} leads</span>
           <span>{stats.converted} converted</span>
           <span>{stats.purchased} purchased</span>
+          <span>{stats.interested} interested</span>
+          <span>{stats.closedChats} chats closed</span>
         </div>
       </header>
 
@@ -511,7 +695,10 @@ function App() {
               <h2>Open Queries</h2>
               <p className="muted">{stats.openQueries} query items are waiting for answer.</p>
               {queries
-                .filter((query) => !query.answered)
+                .filter((query) => {
+                  const lead = leads.find((item) => item.id === query.leadId)
+                  return !query.answered && lead?.chatState !== 'Closed'
+                })
                 .slice(0, 4)
                 .map((query) => {
                   const lead = leads.find((item) => item.id === query.leadId)
@@ -524,6 +711,23 @@ function App() {
                     </div>
                   )
                 })}
+            </article>
+
+            <article className="panel">
+              <h2>Interested Replies</h2>
+              {interestedLeads.length === 0 && (
+                <p className="muted">No interested replies yet. Process lead replies in Lead Follow-up.</p>
+              )}
+              {interestedLeads.slice(0, 5).map((lead) => (
+                <div key={lead.id} className="row">
+                  <div>
+                    <strong>{lead.name}</strong>
+                    <p className="muted">{lead.category} | {lead.phone}</p>
+                    <small className="muted">Reply: {lead.lastReply || 'Interested'}</small>
+                  </div>
+                  <span className="badge interested">Interested</span>
+                </div>
+              ))}
             </article>
           </section>
         )}
@@ -581,7 +785,7 @@ function App() {
             </article>
 
             <article className="panel">
-              <h2>Lead Pipeline</h2>
+              <h2>Lead Pipeline + Chat Flow</h2>
               <div className="table-wrap">
                 <table>
                   <thead>
@@ -589,6 +793,8 @@ function App() {
                       <th>Name</th>
                       <th>Category</th>
                       <th>Status</th>
+                      <th>Chat</th>
+                      <th>Intent</th>
                       <th>Action</th>
                     </tr>
                   </thead>
@@ -606,22 +812,63 @@ function App() {
                           </span>
                         </td>
                         <td>
-                          <select
-                            value={lead.status}
-                            onChange={(event) => moveLeadStatus(lead.id, event.target.value)}
-                          >
-                            <option>New</option>
-                            <option>Follow-up</option>
-                            <option>Qualified</option>
-                            <option>Converted</option>
-                            <option>No Response</option>
-                          </select>
+                          <span className={`badge ${lead.chatState === 'Closed' ? 'closed' : 'open'}`}>
+                            {lead.chatState}
+                          </span>
+                        </td>
+                        <td>
+                          <span className={`badge ${lead.intent.toLowerCase().replace(/\s+/g, '-')}`}>
+                            {lead.intent}
+                          </span>
+                        </td>
+                        <td>
+                          <div className="reply-cell">
+                            <select
+                              value={lead.status}
+                              onChange={(event) => moveLeadStatus(lead.id, event.target.value)}
+                            >
+                              <option>New</option>
+                              <option>Follow-up</option>
+                              <option>Qualified</option>
+                              <option>Converted</option>
+                              <option>No Response</option>
+                            </select>
+                            <input
+                              className="reply-input"
+                              value={replyDrafts[lead.id] || ''}
+                              onChange={(event) =>
+                                setReplyDrafts((prev) => ({ ...prev, [lead.id]: event.target.value }))
+                              }
+                              placeholder={lead.chatState === 'Closed' ? 'Chat closed' : 'Type lead reply...'}
+                              disabled={lead.chatState === 'Closed'}
+                            />
+                            <button
+                              type="button"
+                              className="btn"
+                              onClick={() => processLeadReply(lead.id)}
+                              disabled={lead.chatState === 'Closed'}
+                            >
+                              Auto-Respond
+                            </button>
+                            {lead.lastReply ? <small className="muted">Last: {lead.lastReply}</small> : null}
+                            {lead.autoReply ? (
+                              <small className="muted">
+                                Auto: {lead.autoReply} ({lead.autoReplySource})
+                              </small>
+                            ) : null}
+                          </div>
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
+              <p className="muted status-note">
+                Flow: lead replies - question gets product response - premium questions use calculator response only - not interested closes chat - interested appears on dashboard.
+              </p>
+              <p className="muted status-note">
+                Closed chat restrictions: no auto-response, no status changes, no query actions, and excluded from campaigns.
+              </p>
             </article>
           </section>
         )}
@@ -632,15 +879,21 @@ function App() {
             <p className="muted">Answer quickly and keep high-priority buyers moving.</p>
             {queries.map((query) => {
               const lead = leads.find((item) => item.id === query.leadId)
+              const isClosed = lead?.chatState === 'Closed'
               return (
                 <div key={query.id} className="row query-row">
                   <div>
                     <strong>{lead?.name || 'Unknown lead'}</strong>
                     <p>{query.question}</p>
-                    <small className="muted">{query.priority} priority | {formatTime(query.createdAt)}</small>
+                    <small className="muted">
+                      {query.priority} priority | {formatTime(query.createdAt)}
+                      {isClosed ? ' | Chat Closed' : ''}
+                    </small>
                   </div>
                   {query.answered ? (
                     <span className="badge converted">Answered</span>
+                  ) : isClosed ? (
+                    <span className="badge closed">Restricted</span>
                   ) : (
                     <button type="button" className="btn" onClick={() => answerQuery(query.id)}>
                       Mark Answered
